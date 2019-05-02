@@ -1,0 +1,391 @@
+#!/bin/sh
+POSIXLY_CORRECT=yes
+export POSIXLY_CORRECT
+#debug
+#set -x
+
+#functions
+is_filter(){
+	case $1 in
+	"-a"|"-b"|"-ip"|"-uri") echo 0;;
+	*) echo 1;;
+	esac	
+}
+is_prikaz(){
+	case $1 in
+	"list-ip"|"list-hosts"|"list-uri"|"hist-ip"|"hist-load") echo 0;;
+	*) echo 1;;
+	esac
+}
+get_date(){
+	year=$(printf '%s' "$1" | grep -o -E "[0-9]{4}-" | grep -o -E "[0-9]{4}")
+	month=$(printf '%s' "$1" | grep -o -E "\-[0-9]{1,2}\-" | grep -o -E "[0-9]{1,2}")
+	day=$(printf '%s' "$1" | grep -o -E "\-[0-9]{1,2} " | grep -o -E "[0-9]{1,2}")
+	hour=$(printf '%s' "$1" | grep -o -E " [0-9]{1,2}:" | grep -o -E "[0-9]{1,2}")
+	minutes=$(printf '%s' "$1" | grep -o -E ":[0-9]{1,2}:?" | grep -o -E "[0-9]{1,2}")
+	seconds=$(printf '%s' "$1" | grep -o -E ":[0-9]{1,2}:[0-9]{1,2}" | grep -o -E "[0-9]{1,2}$")
+	if ! test -z $seconds; then
+		seconds=${seconds#0}
+	fi
+	year=$(($year-1970))
+	timestamp=$(($year*365))
+	month=${month#0}
+	month=$(($month-1))
+	while test $month -gt 0;
+	do
+	case $month in
+		"1"|"3"|"5"|"7"|"8"|"10"|"12")
+			timestamp=$((31+$timestamp))
+		;;
+		"4"|"6"|"9"|"11")
+			timestamp=$((30+$timestamp))
+		;;
+		"2")
+			timestamp=$((28+$timestamp))	
+		;;
+	esac
+	month=$(($month-1))
+	done
+	day=${day#0}
+	day=$(($day-1))
+	timestamp=$(($timestamp+$day))
+	timestamp=$(($timestamp*86400))
+	hour=${hour#0}
+	minutes=${minutes#0}
+	timestamp=$(($hour*3600+$timestamp))
+	timestamp=$(($minutes*60+$timestamp))
+	year=$(($year+2))
+	year=$(($year/4))
+	if test $year -gt 0; then
+		timestamp=$((year*86400+$timestamp))
+	fi
+	if ! test -z $seconds; then
+		timestamp=$(($timestamp+$seconds))
+	fi
+	echo $timestamp
+}
+convert_log_toDate(){
+	logLine="$1"
+	ctmpLine=$(printf '%s' "$logLine" | grep -o -E "\[[[:graph:]]* " | sed -E "s/\[//" | sed -E "s/\//\:/g" | sed -E "s/Jan/01/" | sed -E "s/Feb/02/" | sed -E "s/Mar/03/" | sed -E "s/Apr/04/" | sed -E "s/May/05/" | sed -E "s/Jun/06/" | sed -E "s/Jul/07/" | sed -E "s/Aug/08/" | sed -E "s/Sep/09/" | sed -E "s/Oct/10/" | sed -E "s/Nov/11/" | sed -E "s/Dec/12/") #| sed -E "s/:[0-9]{2}$//" 
+	IFS=":"
+
+	one=""
+	two=""
+	three=""
+	four=""
+	five=""
+	six=""
+	for logDate in $(printf '%s' "$ctmpLine");
+	do
+		if test -z "$one"; then
+			one="$logDate"
+		elif test -z "$two"; then
+			two="$logDate"
+		elif test -z "$three"; then
+			three="$logDate"
+		elif test -z "$four"; then
+			four="$logDate"
+		elif test -z "$five"; then
+			five="$logDate"
+		else
+			six="$logDate"
+		fi
+	done
+	IFS="
+"
+	printf '%s' "$three-$two-$one $four:$five:$six"
+}
+
+#variables
+defaultIFS=$IFS
+logs=""
+prikaz=""
+fa="" #filter a
+fb="" #filter b
+fip="" #filter ip
+furi="" #filter uri
+nofilter=0 #false after first commmand
+noprikaz=0 #false after first log
+
+if test $# -gt 0; then
+	#process arguments
+	while test $# -gt 0			#test if there are not illegal arguments
+	do
+		#load filters
+		if test "$(is_filter "$1")" -eq 0; then #&& $counter == 1 ] then
+			if test $nofilter -eq 1; then #filter appeared after command
+				echo "wana: Filter appeared after command"
+				exit 1 #error
+			fi
+			case $1 in
+				"-a"|"-b")
+					if test $# -lt 2; then
+						echo "wana: Argument not given after filter"
+						exit 1 #error
+					fi
+					if test "$1" = "-a";then
+						shift
+						if ! test -z "$fa"; then #double -a filter
+							echo "wana: Filter duplicity '-a'"
+							exit 1 #error
+						fi
+						fa="$1"
+						if test -z "$(printf "%s" "$fa" | grep -o -E "^[0-9]{4}\-(0?[1-9]|1[0-2])\-(0?[1-9]|3[0-1]|[1-2][0-9]) ([0-1]?[0-9]|2[0-3])(\:([0-5][0-9])){1,2}$")"; then
+							echo "wana: Wrong datetime format '-a'"
+							exit 1 #"wrong datetime format a" #error
+						fi
+					else
+						shift
+						if ! test -z "$fb"; then #double -a filter
+							echo "wana: Filter duplicity '-b'"
+							exit 1 #error
+						fi
+						fb="$1"
+						if test -z "$(printf "%s" "$fb" | grep -o -E "^[0-9]{4}\-(0?[1-9]|1[0-2])\-(0?[1-9]|3[0-1]|[1-2][0-9]) ([0-1]?[0-9]|2[0-3])(\:([0-5][0-9])){1,2}$")"; then
+							echo "wana: Wrong datetime format '-b'"
+							exit 1 #error
+						fi
+					fi
+				;;
+				"-ip")
+					if test $# -lt 2;then
+						echo "wana: Argument not given after filter '-ip'"
+						exit 1 #error
+					fi
+					if ! test -z "$fip"; then
+						echo "wana: Filter duplicity '-ip'"
+						exit 1 #error
+					fi
+					shift
+					fip=$1
+					if ! printf "%s" "$1" | grep -q -E "^((0?0?[0-9]|0?[0-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}(0?0?[0-9]|0?[0-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$|^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4})$|^(([0-9a-fA-F]{1,4}:){1,7}:)$|^(([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4})$|^(([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2})$|^(([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3})$|^(([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4})$|^(([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5})$|^([0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6}))$|^(:((:[0-9a-fA-F]{1,4}){1,7}|:))$"; then
+						echo "wana: Wrong ipaddr format"
+						exit 1 #error
+					fi
+				;;
+				"-uri")
+					if test $# -lt 2; then
+						echo "wana: Argument not given after filter '-uri'"
+						exit 1 #error
+					fi
+					if ! test -z "$furi";then
+						echo "wana: Filter duplicity '-uri'"
+						exit 1 #error
+					fi
+					shift
+					furi=$1
+					if ! test -z "$(printf "%s" "$1" | grep -o -E "^[[:graph:]]*\.log[\.0-9]*$")" || test "$(is_prikaz "$1")" -eq 0; then
+						echo "wana: Wrong argument '-uri'"
+						exit 1
+					fi
+				;;
+			esac
+			shift #next arg
+			continue
+		#fi
+		#load command
+		elif test "$(is_prikaz "$1")" -eq 0; then
+			if test $noprikaz -eq 1; then #command appeared after log
+				echo "wana: Log was expected"
+				exit 1 #error
+			fi
+			if ! test -z "$prikaz"; then #error when more commands
+				echo "wana: More than one commands given"
+				exit 1 #error
+			fi
+			prikaz=$1
+			nofilter=1
+			shift #next arg
+			continue
+		#fi
+		#load logs
+		elif printf "%s" "$1" | grep -q -E "^[[:graph:]]*\.log[\.0-9]*$"; then
+			noprikaz=1;
+			if ! test -f "$1"; then
+				echo "wana: The file given does not exist"
+				exit 1 #error
+			fi
+			if test -z "$logs"; then
+				logs=$(cat "$1")
+			else
+				logs="${logs}
+$(cat "$1")"
+			fi
+		#fi
+		#load compressed logs
+		elif printf "%s" "$1" | grep -q -E "^[[:graph:]]*\.gz$"; then
+			if ! test -f "$1"; then
+				echo "wana: The file given does not exist"
+				exit 1 #error
+			fi
+			if test -z "$logs"; then
+				logs=$(gunzip -q -c "$1")
+			else
+				logs="${logs}
+$(gunzip -q -c "$1")"
+			fi
+		else
+			echo "wana: Wrong argument given "
+			exit 1
+		fi
+	shift
+	done
+	#end process arguments
+
+	#read stdin if no logs given
+	if test -z "$logs"; then
+		DONE=false
+		REPLY=""
+		until $DONE; do
+			read REPLY || DONE=true
+			if test -z "$logs"; then
+				logs="$REPLY"
+			else
+				logs="$logs
+$REPLY"
+			fi
+		done
+	fi
+	if test -z "$logs"; then
+		echo "wana: No logs given to stdin"
+		exit 1
+	fi
+
+	#in case no filters and no command
+	if test -z "$fa" && test -z "$fb" && test -z "$fip" && test -z "$furi" && test -z "$prikaz"; then
+		printf "%b" "$logs"
+	fi
+	#do filtering
+		if ! test -z "$fa"; then
+				tmpLogs=""
+				timestampA="$(get_date "$fa")"
+				IFS="
+"
+				for logLines in $(printf '%s' "$logs");
+				do
+					if test "$(get_date "$(convert_log_toDate "$logLines")")" -gt "$timestampA"; then
+						if test -z "$tmpLogs"; then
+							tmpLogs="$logLines"
+						else
+							tmpLogs="$tmpLogs
+$logLines"
+						fi
+					fi
+				done
+				logs=$tmpLogs
+				IFS=$defaultIFS
+			fi
+			if ! test -z "$fb"; then
+				tmpLogs=""
+				timestampB="$(get_date "$fb")"
+				IFS="
+"
+				for logLines in $(printf '%s' "$logs");
+				do
+					if test "$(get_date "$(convert_log_toDate "$logLines")")" -lt "$timestampB"; then
+						if test -z "$tmpLogs"; then
+							tmpLogs="$logLines"
+						else
+							tmpLogs="$tmpLogs
+$logLines"
+						fi
+					fi
+				done
+				logs=$tmpLogs
+				IFS=$defaultIFS
+			fi
+			if ! test -z "$fip"; then
+				tmpLines=""
+				IFS="
+"
+				for logLines in $(printf '%s' "$logs"); do
+					if ! test -z "$(printf '%s' "$logLines" | awk '{print $1}' | grep -o -E "$fip")"; then
+						if test -z "$tmpLines"; then
+							tmpLines="$logLines"
+						else
+							tmpLines="$tmpLines
+$logLines"
+						fi
+					fi
+				done
+				IFS=$defaultIFS
+				logs="$tmpLines"
+			fi
+			if ! test -z "$furi"; then
+				tmpLines=""
+				IFS="
+"
+				for logLines in $(printf '%s' "$logs"); do
+					if printf '%s\n' "$logLines" | awk '{print $6}' | grep -q -E "(^\"GET)|(^\"POST)|(^\"HEAD)|(^\"PUT)|(^\"DELETE)|(^\"CONNECT)|(^\"OPTIONS)|(^\"TRACE)|(^\"PATCH)"; then
+					if ! test -z "$(printf '%s\n' "$logLines" | awk '{print $7}' | sed -E 's/(^"GET)|(^"POST)|(^"HEAD)|(^"PUT)|(^"DELETE)|(^"CONNECT)|(^"OPTIONS)|(^"TRACE)|(^"PATCH)//' | grep -o -E "$furi")"; then
+						if test -z "$tmpLines"; then
+							tmpLines="$logLines"
+						else
+							tmpLines="$tmpLines
+$logLines"
+						fi
+					fi
+					fi
+				done
+				logs="$tmpLines"
+				IFS="$defaultIFS"
+			fi
+
+	#do processing
+	case $prikaz in
+		"list-ip") #ok
+			printf "%b" "$logs" | awk '{print $1}' | sort -b -n |uniq
+		;;
+		"list-hosts")
+			tmpLogs=$(printf "%b" "$logs" | awk '{print $1}' | sort -b |uniq)
+			for ip in $(printf '%s\n' "$tmpLogs");
+			do
+				hostVar=$(host "$ip")
+				if test $? -eq 0 && test -z $(printf '%s' "$hostVar" | grep -o -E "2(SERVFAIL)"); then
+					printf '%s\n' "$hostVar" | sed -E 's/[[:graph:] ]*pointer //'
+				else
+					printf '%s\n' "$ip"
+				fi
+			done
+		;;
+		"list-uri") #ok
+		tmp=$(printf '%s' "$logs" | awk '{print $6 $7}' | sort -b -n |uniq)
+		for i in $tmp;
+		do
+			if printf '%s\n' "$i" | grep -q -E "(^\"GET)|(^\"POST)|(^\"HEAD)|(^\"PUT)|(^\"DELETE)|(^\"CONNECT)|(^\"OPTIONS)|(^\"TRACE)|(^\"PATCH)"; then
+				printf '%s\n' "$i" | sed -E 's/(^"GET)|(^"POST)|(^"HEAD)|(^"PUT)|(^"DELETE)|(^"CONNECT)|(^"OPTIONS)|(^"TRACE)|(^"PATCH)//'
+			fi
+		done
+		;;
+		"hist-ip") #ok
+			printf "%b" "$logs" | awk '{print $1}' | sort -b -n |uniq -c | sort -n -r | awk '{printf "%s (%s): " ,$2 ,$1; for(i=0;i<$1;i++) printf "#"; printf"\n"}'
+		;;
+		"hist-load")
+			histtmpLine=""
+			IFS="
+"
+			for histlogLines in $(printf '%s' "$logs"); do
+				histtmp="$(printf '%s' "$(convert_log_toDate "$histlogLines")" | sed -E "s/:[0-9]{1,2}:[0-9]{1,2}/:00/")"
+				if test -z "$histtmpLine"; then
+					histtmpLine="$histtmp"
+				else
+					histtmpLine="$histtmpLine
+$histtmp"
+				fi
+			done
+			IFS=$defaultIFS
+			printf '%s\n' "$histtmpLine" | sort -b -n | uniq -c | awk '{printf "%s (%s): " ,$0 ,$1; for(i=0;i<$1;i++) printf "#"; printf"\n"}' | awk '{for (i=2; i<NF; i++) printf $i " "; print $NF}' 
+		;;
+	esac
+	if test -z "$prikaz"; then
+		printf '%s\n' "$logs"
+		exit 0
+	fi
+#no arguments given		
+else
+	while true; do
+		read -r tmp
+		printf "%b" "$tmp
+"
+	done
+fi
